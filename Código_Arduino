@@ -1,0 +1,178 @@
+/*Medición de Periodo/Frecuencia con interrupción.
+ * El registro de datos en formato CSV se activa/desactiva con r de record y s de stop, y con enter
+
+ * HARDWARE:
+ * - Sensor TCRT5000 (Salida Digital D0) -> Pin 2
+ * - LCD SDA -> Pin A4
+ * - LCD SCL -> Pin A5
+ */
+#include <Wire.h> 
+#include <LiquidCrystal_I2C.h>
+
+// Configuración de la pantalla LCD
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+
+// Definición de pines
+const int sensorPin = 2;   // Pin para el sensor 
+
+// Variables volátiles
+volatile unsigned long tiempoAnterior = 0;
+volatile unsigned long periodoActual = 0;
+volatile bool nuevoPulso = false;
+
+// Variables globales
+unsigned long periodoUltimoValido = 0; 
+unsigned long ultimaDeteccionGlobal = 0;
+// 2 segundos en microsegundos (para forzar 0 Hz si no hay actividad)
+const unsigned long timeoutSensor = 2000000; 
+
+// Variables para actualización
+unsigned long ultimaActualizacionLCD = 0;
+const int intervaloLCD = 300; // Actualizar pantalla cada 300ms
+
+// Variables de estado del logging
+bool isLogging = false; 
+
+// Funciones
+void sensorISR();
+void mostrarDatosLCD(float t, float f, bool loggingState);
+void manejarControlSerial();
+
+void setup() {
+  Serial.begin(9600);
+  
+  // Imprimir instrucciones para el usuario
+  Serial.println("Presionar 'R' para iniciar la grabación (CSV) o 'S' para detener");
+  // 1. Inicializar LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0,0);
+  lcd.print("Iniciando...");
+  delay(1000);
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("T(ms):");
+  lcd.setCursor(0,1);
+  lcd.print("F(Hz):");
+  mostrarDatosLCD(0.00, 0.00, false); 
+
+  // 2. Pines
+  // Sensor con PULLUP
+  pinMode(sensorPin, INPUT_PULLUP);
+
+  // 3. Inicializar Tiempos
+  ultimaDeteccionGlobal = micros();
+  tiempoAnterior = micros();
+
+  // 4. Configuración Interrupción del Sensor
+  attachInterrupt(digitalPinToInterrupt(sensorPin), sensorISR, FALLING);
+}
+
+void loop() {
+  
+  // Control serial
+  manejarControlSerial();
+
+  // Lectura y manejo
+  if (nuevoPulso) {
+    noInterrupts();
+    periodoUltimoValido = periodoActual; 
+    nuevoPulso = false;
+    interrupts();
+    
+    ultimaDeteccionGlobal = micros(); 
+  }
+  
+  // Aquí manda el valor a cero si no está midiendo nada en el intervalo propuesto
+  if (micros() - ultimaDeteccionGlobal > timeoutSensor) {
+    periodoUltimoValido = 0; 
+  }
+
+  // Cálculo y registro
+  if (millis() - ultimaActualizacionLCD >= intervaloLCD) {
+    ultimaActualizacionLCD = millis();
+    
+    float frecuencia = 0.0;
+    float periodoMs = 0.0;
+
+    if (periodoUltimoValido > 0) { 
+      frecuencia = 1000000.0 / periodoUltimoValido;
+      periodoMs = periodoUltimoValido / 1000.0;
+    }
+
+    // 1. Impresión de la pantalla
+    mostrarDatosLCD(periodoMs, frecuencia, isLogging);
+    
+    // 2. Registro de datos CSV (solo si isLogging es TRUE)
+    // El Serial.print solo ocurre aquí, asegurando que no se mezclen mensajes.
+    if (isLogging) {
+      // Formato CSV: Tiempo_ms,Periodo_ms,Frecuencia_Hz
+      Serial.print(millis());
+      Serial.print(",");
+      Serial.print(periodoMs, 3); // 3 decimales
+      Serial.print(",");
+      Serial.println(frecuencia, 3); // 3 decimales y nueva línea
+    }
+  }
+}
+
+// --- FUNCIÓN DE CONTROL SERIAL ---
+void manejarControlSerial() {
+  if (Serial.available() > 0) {
+    char incomingByte = Serial.read();
+
+    if (incomingByte == 'R' || incomingByte == 'r') {
+      if (!isLogging) { // Solo iniciar si no está grabando
+        isLogging = true;
+        // Marcador claro de inicio de datos CSV, incluyendo el encabezado
+        Serial.println("\n*** INICIO CSV: COPIA DESDE LA SIGUIENTE LINEA ***");
+        Serial.println("Tiempo_ms,Periodo_ms,Frecuencia_Hz"); 
+      }
+    } else if (incomingByte == 'S' || incomingByte == 's') {
+      if (isLogging) { // Solo detener si está grabando
+        isLogging = false;
+        // Marcador claro de fin de datos CSV
+        Serial.println("*** FIN CSV: COPIA HASTA LA LINEA ANTERIOR ***\n");
+      }
+    }
+    // Opcional: limpiar cualquier caracter restante en el buffer
+    while (Serial.available() > 0) {
+      Serial.read();
+    }
+  }
+}
+
+// --- Función de Interrupción (ISR) ---
+void sensorISR() {
+  unsigned long tiempoActual = micros(); 
+  
+  // Anti-rebote reducido a 1ms (1000us)
+  if (tiempoActual - tiempoAnterior > 1000) { 
+    periodoActual = tiempoActual - tiempoAnterior;
+    tiempoAnterior = tiempoActual;
+    nuevoPulso = true;
+  }
+}
+
+// Función auxiliar para limpiar y escribir en LCD
+void mostrarDatosLCD(float t, float f, bool loggingState) {
+  // Fila 1: Periodo (T)
+  lcd.setCursor(6, 0); 
+  lcd.print("          "); // Limpia 10 espacios
+  lcd.setCursor(6, 0);
+  lcd.print(t, 3);     // 3 decimales
+
+  // Fila 2: Frecuencia (F)
+  lcd.setCursor(6, 1); 
+  lcd.print("          "); // Limpia 10 espacios
+  lcd.setCursor(6, 1);
+  lcd.print(f, 3);     // 3 decimales
+
+  // Estado de registro (Columna 12, Fila 1)
+  lcd.setCursor(12, 1);
+  if (loggingState) {
+    lcd.print(" REC"); // Registrando
+  } else {
+    lcd.print("STOP"); // Detenido
+  }
+}
